@@ -1,0 +1,8 @@
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\obj\Debug\ssisReader.csprojResolveAssemblyReference.cache
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\obj\Debug\ssisReader.csproj.CoreCompileInputs.cache
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\bin\Debug\ssisReader.exe.config
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\bin\Debug\ssisReader.exe
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\bin\Debug\ssisReader.pdb
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\obj\Debug\ssisReader.exe
+\\denlslsfile04\homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\obj\Debug\ssisReader.pdb
+\\denlslsfile04\Homes\SMazumder\Visual Studio 2017\Projects\ssisReader\ssisReader\bin\Debug\MarkdownLog.dll

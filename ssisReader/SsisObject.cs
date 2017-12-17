@@ -1,0 +1,1578 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Data;
+using MarkdownLog;
+
+namespace ssisReader
+{
+    public class SsisObject
+    {
+        /// <summary>
+        /// The XML node type of this object
+        /// </summary>
+        public string DtsObjectType;
+
+        /// <summary>
+        /// The human readable name of this object
+        /// </summary>
+        public string DtsObjectName;
+        private string _FunctionName;
+        private string _FolderName;
+
+        /// <summary>
+        /// A user-readable explanation of what this is
+        /// </summary>
+        public string Description;
+
+        /// <summary>
+        /// The GUID for this object
+        /// </summary>
+        public Guid DtsId;
+
+        /// <summary>
+        /// Attributes, if any
+        /// </summary>
+        public Dictionary<string, string> Attributes = new Dictionary<string, string>();
+
+        /// <summary>
+        /// All the properties defined in the SSIS
+        /// </summary>
+        public Dictionary<string, string> Properties = new Dictionary<string, string>();
+
+        /// <summary>
+        /// List of child elements in SSIS
+        /// </summary>
+        public List<SsisObject> Children = new List<SsisObject>();
+        public SsisObject Parent = null;
+
+        /// <summary>
+        /// Save the content value of a complex object
+        /// </summary>
+        public string ContentValue;
+
+        #region Lineage Column Helpers
+        private List<LineageObject> _lineage_columns = new List<LineageObject>();
+
+        /// <summary>
+        /// Shortcut to find a lineage object
+        /// </summary>
+        /// <param name="id"></param>
+        /// <returns></returns>
+        public LineageObject GetLineageObjectById(string id)
+        {
+            return (from LineageObject l in _lineage_columns where (l.LineageId == id) select l).FirstOrDefault();
+        }
+
+        #endregion
+        private List<ProgramVariable> _scope_variables = new List<ProgramVariable>();
+
+        #region Shortcuts
+
+        /// <summary>
+        /// Set a property
+        /// </summary>
+        /// <param name="prop_name"></param>
+        /// <param name="prop_value"></param>
+        public void SetProperty(string prop_name, string prop_value)
+        {
+            if (prop_name == "ObjectName")
+            {
+                DtsObjectName = prop_value;
+            }
+            else if (prop_name == "DTSID")
+            {
+                DtsId = Guid.Parse(prop_value);
+                _guid_lookup[DtsId] = this;
+            }
+            else if (prop_name == "Description")
+            {
+                Description = prop_value;
+            }
+            else
+            {
+                Properties[prop_name] = prop_value;
+            }
+        }
+
+        /// <summary>
+        /// Retrieve a child with the specific name
+        /// </summary>
+        /// <param name="objectname"></param>
+        public SsisObject GetChildByType(string objectname)
+        {
+            return (from SsisObject o in Children where o.DtsObjectType == objectname select o).FirstOrDefault();
+        }
+
+        /// <summary>
+        /// Retrieve a child with the specific name
+        /// </summary>
+        /// <param name="objectname"></param>
+        public SsisObject GetChildByTypeAndAttr(string objectname, string attribute, string value)
+        {
+            return (from SsisObject o in Children
+                    where (o.DtsObjectType == objectname)
+                    && (o.Attributes[attribute] == value)
+                    select o).FirstOrDefault();
+        }
+        #endregion
+
+        #region Translate this object into Docs
+        /// <summary>
+        /// Produce this variable 
+        /// </summary>
+        /// <param name="indent_depth"></param>
+        /// <param name="as_global"></param>
+        /// <param name="sw"></param>
+        internal ProgramVariable EmitVariable(string indent, bool as_global)
+        {
+            ProgramVariable vd = new ProgramVariable(this, as_global);
+
+            // Do we add comments for these variables?
+            if (as_global)
+            {
+                if (!String.IsNullOrEmpty(vd.Comment))
+                {
+                    SourceWriter.WriteLine();
+                    SourceWriter.WriteLine("{0}{1}", indent, vd.Comment);
+                }
+            }
+            
+            SourceWriter.WriteLine(String.Format(@"* **{0}**", vd.VariableName));
+            
+            SourceWriter.WriteLine();
+
+            if (vd.DefaultValue != null)
+            {
+                if (vd.DefaultValue.Contains("\r\n"))
+                {
+                    vd.DefaultValue = vd.DefaultValue.Replace("\r\n", "\\r\\n");
+                }                 
+            }
+
+            if (vd.Expression != null)
+            {
+                if (vd.Expression.Contains("\r"))
+                {
+                    vd.Expression = vd.Expression.Replace("\r", "\\r");
+                }
+                if (vd.Expression.Contains("\n"))
+                {
+                    vd.Expression = vd.Expression.Replace("\n", "\\n");
+                }
+                if (vd.Expression.Contains("\t"))
+                {
+                    vd.Expression = vd.Expression.Replace("\t", "\\t");
+                }
+            }
+
+            var data = new[]
+            {
+                new {Name = "Type", Value =  vd.CSharpType},
+                new {Name = "Value", Value =  vd.DefaultValue},
+                new {Name = "DtsType", Value =  vd.DtsType},                
+                new {Name = "Namespace", Value =  vd.Namespace},
+                new {Name = "IsGlobal?", Value =  vd.IsGlobal.ToString()},
+                new {Name ="Expression", Value =vd.Expression},
+                new {Name ="EvaluateAsExpression", Value = vd.EvaluateAsExpression },
+                new {Name ="ReadOnly", Value =vd.ReadOnly},
+                new {Name ="RaiseChangedEvent", Value =vd.RaiseChangedEvent},
+                new {Name ="IncludeInDebugDump", Value =vd.IncludeInDebugDump},
+                new {Name ="DTSID", Value =vd.DTSID},
+                new {Name ="Description", Value =vd.Description},
+                new {Name ="CreationName", Value =vd.CreationName}
+            };
+
+            SourceWriter.WriteLine(data.ToMarkdownTable());
+
+            // Variables so we can do type conversions in the future!
+            _var_dict[vd.VariableName] = vd;
+            return vd;
+        }
+
+        protected static Dictionary<string, ProgramVariable> _var_dict = new Dictionary<string, ProgramVariable>();
+
+        /// <summary>
+        /// Produce this variable to the current stream
+        /// </summary>
+        /// <param name="indent_depth"></param>
+        /// <param name="as_global"></param>
+        /// <param name="sw"></param>
+        internal void EmitFunctionsAsSequence(string indent, List<ProgramVariable> scope_variables)
+        {
+            _scope_variables.AddRange(scope_variables);
+
+            // Header and comments
+            SourceWriter.WriteLine();            
+
+            // Function intro
+            SourceWriter.WriteLine("{0}* **{1}** {2}", indent, GetFunctionName(), GetScopeVariables(true));
+            SourceWriter.WriteLine();
+            indent = indent + "\t";
+            
+            EmitChildObjectsSequence(indent);            
+        }
+
+        /// <summary>
+        /// Produce this variable to the current stream
+        /// </summary>
+        /// <param name="indent_depth"></param>
+        /// <param name="as_global"></param>
+        /// <param name="sw"></param>
+        internal void EmitFunction(string indent, List<ProgramVariable> scope_variables)
+        {
+            _scope_variables.AddRange(scope_variables);
+
+            // Header and comments
+            SourceWriter.WriteLine();
+
+            // Function intro
+            SourceWriter.WriteLine("{0}* **{1}** {2}", indent, GetFunctionName(), GetScopeVariables(true));
+            SourceWriter.WriteLine();
+            indent = indent + "\t";            
+
+            // What type of executable are we?  Let's check if special handling is required
+            string exec_type = Attributes["DTS:ExecutableType"];
+
+            //Child script project - Emit it as a sub - project within the greater solution!
+            if (exec_type.StartsWith("Microsoft.SqlServer.Dts.Tasks.ScriptTask.ScriptTask"))
+            {
+                //ProjectWriter.EmitScriptProject(this, indent);
+                //SourceWriter.WriteLine("script task - handle later", indent);
+            }
+            else if (exec_type.StartsWith("Microsoft.SqlServer.Dts.Tasks.ExecuteSQLTask.ExecuteSQLTask"))
+            {
+                this.EmitSqlTask(indent);
+                //Basic "SEQUENCE" construct - just execute things in order!
+            }
+            else if (exec_type.StartsWith("STOCK:SEQUENCE"))
+            {
+                EmitChildObjects(indent);                
+            }
+            else if (exec_type == "STOCK:FORLOOP")
+            {
+                this.EmitForLoop(indent);
+            }
+            else if (exec_type == "STOCK:FOREACHLOOP")
+            {
+                this.EmitForEachLoop(indent);
+            }
+            else if (exec_type == "SSIS.Pipeline.2")
+            {
+                EmitChildObjects(indent);
+                this.EmitPipeline(indent);
+            }
+            else if (exec_type.StartsWith("Microsoft.SqlServer.Dts.Tasks.SendMailTask.SendMailTask"))
+            {
+                this.EmitSendMailTask(indent);
+            }
+            else
+            {
+                SourceWriter.Help(this, "I don't yet know how to handle " + exec_type);
+            }          
+        }
+
+        private void EmitSendMailTask(string indent)
+        {
+            // Navigate to our object data
+            SsisObject mail = GetChildByType("DTS:ObjectData").GetChildByType("SendMailTask:SendMailTaskData");
+
+            SourceWriter.WriteLine(@"{0}MailMessage message = new MailMessage();", indent);
+            SourceWriter.WriteLine(@"{0}message.To.Add(""{1}"");", indent, mail.Attributes["SendMailTask:To"]);
+            SourceWriter.WriteLine(@"{0}message.Subject = ""{1}"";", indent, mail.Attributes["SendMailTask:Subject"]);
+            SourceWriter.WriteLine(@"{0}message.From = new MailAddress(""{1}"");", indent, mail.Attributes["SendMailTask:From"]);
+
+            // Handle CC/BCC if available
+            string addr = null;
+            if (mail.Attributes.TryGetValue("SendMailTask:CC", out addr) && !String.IsNullOrEmpty(addr))
+            {
+                SourceWriter.WriteLine(@"{0}message.CC.Add(""{1}"");", indent, addr);
+            }
+            if (mail.Attributes.TryGetValue("SendMailTask:BCC", out addr) && !String.IsNullOrEmpty(addr))
+            {
+                SourceWriter.WriteLine(@"{0}message.Bcc.Add(""{1}"");", indent, addr);
+            }
+
+            // Process the message source
+            string sourcetype = mail.Attributes["SendMailTask:MessageSourceType"];
+            if (sourcetype == "Variable")
+            {
+                SourceWriter.WriteLine(@"{0}message.Body = {1};", indent, FixVariableName(mail.Attributes["SendMailTask:MessageSource"]));
+            }
+            else if (sourcetype == "DirectInput")
+            {
+                SourceWriter.WriteLine(@"{0}message.Body = @""{1}"";", indent, mail.Attributes["SendMailTask:MessageSource"].Replace("\"", "\"\""));
+            }
+            else
+            {
+                SourceWriter.Help(this, "I don't understand the SendMail message source type '" + sourcetype + "'");
+            }
+
+            // Get the SMTP configuration name
+            SourceWriter.WriteLine(@"{0}using (var smtp = new SmtpClient(ConfigurationManager.AppSettings[""{1}""])) {{", indent, GetObjectByGuid(mail.Attributes["SendMailTask:SMTPServer"]).DtsObjectName);
+            SourceWriter.WriteLine(@"{0}    smtp.Send(message);", indent);
+            SourceWriter.WriteLine(@"{0}}}", indent);
+        }
+
+        private void EmitSqlTask(string indent)
+        {
+            EmitChildObjects(indent);
+        }
+
+        private void EmitChildObjectsSequence(string indent)
+        {
+            string newindent = indent;
+
+            // To handle precedence data correctly, first make a list of encumbered children
+            List<SsisObject> modified_children = new List<SsisObject>();
+            modified_children.AddRange(Children);
+
+            // Write comments for the precedence data - we'll eventually have to handle this
+            List<PrecedenceData> precedence = new List<PrecedenceData>();
+            foreach (SsisObject o in Children)
+            {
+                if (o.DtsObjectType == "DTS:PrecedenceConstraint")
+                {
+                    PrecedenceData pd = new PrecedenceData(o);
+
+                    // Does this precedence data affect any children?  Find it and move it
+                    var c = (from SsisObject obj in modified_children where obj.DtsId == pd.AfterGuid select obj).FirstOrDefault();
+                    modified_children.Remove(c);
+
+                    // Add it to the list
+                    precedence.Add(pd);
+                }
+            }
+
+            if (modified_children.Count > 0)
+            {
+                // Function body
+                foreach (SsisObject o in modified_children)
+                {
+
+                    // Are there any precedence triggers after this child?
+                    PrecedenceChainForSequence(o, precedence, newindent);
+                }
+            }
+        }
+
+        private void EmitChildObjects(string indent)
+        {
+            string newindent = indent;
+
+            // To handle precedence data correctly, first make a list of encumbered children
+            List<SsisObject> modified_children = new List<SsisObject>();
+            modified_children.AddRange(Children);
+
+            // Write comments for the precedence data - we'll eventually have to handle this
+            List<PrecedenceData> precedence = new List<PrecedenceData>();
+            foreach (SsisObject o in Children)
+            {
+                if (o.DtsObjectType == "DTS:PrecedenceConstraint")
+                {
+                    PrecedenceData pd = new PrecedenceData(o);
+
+                    // Does this precedence data affect any children?  Find it and move it
+                    var c = (from SsisObject obj in modified_children where obj.DtsId == pd.AfterGuid select obj).FirstOrDefault();
+                    modified_children.Remove(c);
+
+                    // Add it to the list
+                    precedence.Add(pd);
+                }
+            }
+
+            if (modified_children.Count > 0)
+            {
+                //SourceWriter.WriteLine("{0}// These calls have no dependencies", newindent);
+
+                // Function body
+                foreach (SsisObject o in modified_children)
+                {
+
+                    // Are there any precedence triggers after this child?
+                    PrecedenceChain(o, precedence, newindent);
+                }
+            }
+        }
+
+        private void PrecedenceChainForSequence(SsisObject prior_obj, List<PrecedenceData> precedence, string indent)
+        {
+            EmitOneChildForSequence(prior_obj, indent);
+
+            // We just executed "prior_obj" - find what objects it causes to be triggered
+            var triggered = (from PrecedenceData pd in precedence where pd.BeforeGuid == prior_obj.DtsId select pd);
+
+            // Iterate through each of these
+            foreach (PrecedenceData pd in triggered)
+            {
+
+                // Write a comment
+                SourceWriter.WriteLine();
+                SourceWriter.WriteLine("{0}> {1}", indent, pd.ToString());
+                SourceWriter.WriteLine();
+
+                PrecedenceChainForSequence(pd.Target, precedence, indent);
+                
+            }
+        }
+
+        private void PrecedenceChain(SsisObject prior_obj, List<PrecedenceData> precedence, string indent)
+        {
+            EmitOneChild(prior_obj, indent);
+
+            // We just executed "prior_obj" - find what objects it causes to be triggered
+            var triggered = (from PrecedenceData pd in precedence where pd.BeforeGuid == prior_obj.DtsId select pd);
+
+            // Iterate through each of these
+            foreach (PrecedenceData pd in triggered)
+            {
+                // Write a comment
+                SourceWriter.WriteLine();
+                SourceWriter.WriteLine("{0}> {1}", indent, pd.ToString());
+                SourceWriter.WriteLine();
+
+                PrecedenceChain(pd.Target, precedence, indent);
+               
+            }
+        }
+
+        private void EmitOneChild(SsisObject childobj, string newindent)
+        {
+            // Is this a dummy "Object Data" thing?  If so ignore it and delve deeper
+            if (childobj.DtsObjectType == "DTS:ObjectData")
+            {
+                childobj = childobj.Children[0];
+            }
+
+            // For variables, emit them within this function
+            if (childobj.DtsObjectType == "DTS:Variable")
+            {
+                _scope_variables.Add(childobj.EmitVariable(newindent, false));
+            }
+            else if (childobj.DtsObjectType == "DTS:Executable")
+            {
+                //childobj.EmitFunctionCall(newindent, GetScopeVariables(false));
+
+                childobj.EmitFunction(newindent , _scope_variables);
+                
+                ////Now emit any other functions that are chained into this
+                //foreach (SsisObject o in childobj.Children)
+                //{
+                //    if (o.DtsObjectType == "DTS:Executable")
+                //    {
+                        
+                //    }
+                //    else if (o.DtsObjectType == "DTS:ObjectData")
+                //    {
+                //        EmitOneChild(o, newindent + "\t");
+                //    }
+                //}
+            }
+            else if (childobj.DtsObjectType == "SQLTask:SqlTaskData")
+            {
+                childobj.EmitSqlStatement(newindent);                
+            }
+            else if (childobj.DtsObjectType == "pipeline")
+            {
+                childobj.EmitPipeline(newindent);
+            }
+            else if (childobj.DtsObjectType == "DTS:PrecedenceConstraint")
+            {
+                // ignore it - it's already been handled
+            }
+            else if (childobj.DtsObjectType == "DTS:LoggingOptions")
+            {
+                // Ignore it - I can't figure out any useful information on this object
+            }
+            else if (childobj.DtsObjectType == "DTS:ForEachVariableMapping")
+            {
+                // ignore it - handled earlier
+            }
+            else if (childobj.DtsObjectType == "DTS:ForEachEnumerator")
+            {
+                // ignore it - handled explicitly by the foreachloop
+            }
+            else
+            {
+                SourceWriter.WriteLine(newindent+ "I don't yet know how to handle " + childobj.DtsObjectType);
+            }
+        }
+
+
+        private void EmitOneChildForSequence(SsisObject childobj, string newindent)
+        {
+            // Is this a dummy "Object Data" thing?  If so ignore it and delve deeper
+            if (childobj.DtsObjectType == "DTS:ObjectData")
+            {
+                childobj = childobj.Children[0];
+            }
+
+            // For variables, emit them within this function
+            if (childobj.DtsObjectType == "DTS:Variable")
+            {
+                _scope_variables.Add(childobj.EmitVariable(newindent, false));
+            }
+            else if (childobj.DtsObjectType == "DTS:Executable")
+            {
+                childobj.EmitFunctionCall(newindent, GetScopeVariables(false));
+                
+                //Now emit any other functions that are chained into this
+                foreach (SsisObject o in childobj.Children)
+                {
+                    if (o.DtsObjectType == "DTS:Executable")
+                    {
+                        o.EmitFunctionsAsSequence(newindent + "\t", _scope_variables);
+                    }
+                }
+            }
+            else if (childobj.DtsObjectType == "SQLTask:SqlTaskData")
+            {
+                //childobj.EmitSqlStatement(newindent);
+
+                // TODO: Handle "pipeline" objects
+            }
+            else if (childobj.DtsObjectType == "pipeline")
+            {
+                //childobj.EmitPipeline(newindent);
+            }
+            else if (childobj.DtsObjectType == "DTS:PrecedenceConstraint")
+            {
+                // ignore it - it's already been handled
+            }
+            else if (childobj.DtsObjectType == "DTS:LoggingOptions")
+            {
+                // Ignore it - I can't figure out any useful information on this object
+            }
+            else if (childobj.DtsObjectType == "DTS:ForEachVariableMapping")
+            {
+                // ignore it - handled earlier
+            }
+            else if (childobj.DtsObjectType == "DTS:ForEachEnumerator")
+            {
+                // ignore it - handled explicitly by the foreachloop
+            }
+            //else
+            //{
+            //    SourceWriter.Help(this, "I don't yet know how to handle " + childobj.DtsObjectType);
+            //}
+        }
+
+        private void EmitForEachVariableMapping(string indent)
+        {
+            string varname = FixVariableName(this.Properties["VariableName"]);
+
+            // Look up the variable data
+            ProgramVariable vd = _var_dict[varname];
+
+            // Produce a line
+            SourceWriter.WriteLine(String.Format(@"{0}{1} = ({3})iter.ItemArray[{2}];", indent, varname, this.Properties["ValueIndex"], vd.CSharpType));
+        }
+
+        enum iteratorTypeEnum
+        {
+            //•Foreach File Enumerator: Enumerates files in a folder 
+            //•Foreach Item Enumerator: Enumerates items in a collection, such as the executables specified in an Execute Process task. 
+            //•Foreach ADO Enumerator: Enumerates rows in a table, such as the rows in an ADO recordset. 
+            //•Foreach ADO.NET Schema Rowset Enumerator: Enumerates schema information about a data source. 
+            //•Foreach From Variable Enumerator: Enumerates a list of objects in a variable, such as an array or ADO.NET DataTable. 
+            //•ForeachNodeList Enumerator: Enumerates the result set of an XML Path Language (XPath) expression.
+            //•Foreach SMO Enumerator: Enumerates a list of SQL Server Management Objects (SMO) objects, such as a list of views in a database.
+                  ForeachFileEnumerator
+                , ForeachItemEnumerator
+                , ForeachADOEnumerator
+                , ForeachADONETSchemaRowsetEnumerator
+                , ForeachFromVariableEnumerator
+                , ForeachNodeListEnumerator
+                , ForeachSMOEnumerator
+        };
+
+        private void EmitForEachLoop(string indent)
+        {
+            string iteratorType;
+            string iterator = "";
+            string fileSpec = "";
+            string FileNameRetrievalType = "";
+
+            string creationName = GetChildByType("DTS:ForEachEnumerator").Properties["CreationName"];
+
+            if (creationName.Contains("ForEachFileEnumerator"))
+            {
+                //Enumerates files in a folder 
+                iteratorType = iteratorTypeEnum.ForeachFileEnumerator.ToString();
+            }
+            else if(creationName.Contains("ForEachADOEnumerator"))
+            {
+                //Most Probable Use
+                //Enumerates rows in a table, such as the rows in an ADO recordset.
+                iteratorType = iteratorTypeEnum.ForeachADOEnumerator.ToString();
+            }
+            else {
+                //Use ADOEnumerator for now 
+                //Need to handle other types of enumerators
+                iteratorType = iteratorTypeEnum.ForeachADOEnumerator.ToString();
+            }            
+
+            if (iteratorType == iteratorTypeEnum.ForeachADOEnumerator.ToString())
+            {
+                iterator = GetChildByType("DTS:ForEachEnumerator").GetChildByType("DTS:ObjectData").Children[0].Attributes["VarName"];
+                // Write it out - foreach row in data table 
+                SourceWriter.WriteLine(String.Format(@"{0}FOREACH (Record in {1})", indent, iterator));
+            }
+            else if (iteratorType == iteratorTypeEnum.ForeachFileEnumerator.ToString())
+            {
+                iterator = GetChildByType("DTS:ForEachEnumerator").GetChildByType("DTS:ObjectData").Children[0].Children[0].Attributes["Folder"];
+                fileSpec = GetChildByType("DTS:ForEachEnumerator").GetChildByType("DTS:ObjectData").Children[0].Children[1].Attributes["FileSpec"];
+                FileNameRetrievalType = GetChildByType("DTS:ForEachEnumerator").GetChildByType("DTS:ObjectData").Children[0].Children[2].Attributes["FileNameRetrievalType"];
+                if (FileNameRetrievalType == "0")
+                {
+                    FileNameRetrievalType = "Fully Qualified";
+                }
+                else if (FileNameRetrievalType == "1")
+                {
+                    FileNameRetrievalType = "Name and Extension";
+                }
+                else if (FileNameRetrievalType == "2")
+                {
+                    FileNameRetrievalType = "Name Only";
+                }
+
+                // Write it out - foreach file in filepath
+                SourceWriter.WriteLine(String.Format(@"{0}FOREACH File with Name **{1}** in path *{2}* ", indent,  FileNameRetrievalType, iterator));
+
+                SourceWriter.WriteLine(String.Format(@"{0}[Match Type: ""{1}""] ", indent, fileSpec));                
+            }            
+            
+            SourceWriter.WriteLine();
+            string newindent = indent + "    ";            
+
+            // Do all the iteration mappings first
+            foreach (SsisObject childobj in Children)
+            {
+                if (childobj.DtsObjectType == "DTS:ForEachVariableMapping")
+                {
+                    childobj.EmitForEachVariableMapping(indent + "    ");
+                }
+            }
+            SourceWriter.WriteLine();
+
+            // Other interior objects and tasks
+            EmitChildObjects(indent);            
+        }
+
+        private void EmitForLoop(string indent)
+        {
+            // Retrieve the three settings from the for loop
+            string init = System.Net.WebUtility.HtmlDecode(this.Properties["InitExpression"]).Replace("@", "");
+            string eval = System.Net.WebUtility.HtmlDecode(this.Properties["EvalExpression"]).Replace("@", "");
+            string assign = System.Net.WebUtility.HtmlDecode(this.Properties["AssignExpression"]).Replace("@", "");
+
+            // Write it out
+            SourceWriter.WriteLine(String.Format(@"{0}for ({1};{2};{3}) {{", indent, init, eval, assign));
+
+            // Inner stuff ?
+            EmitChildObjects(indent);
+
+            // Close the loop
+            SourceWriter.WriteLine(String.Format(@"{0}}}", indent));
+        }
+
+        /// <summary>
+        /// Write out a function call
+        /// </summary>
+        /// <param name="indent"></param>
+        /// <param name="sw"></param>
+        private void EmitFunctionCall(string indent, string scope_variables)
+        {
+            // Is this call disabled?
+            if (Properties["Disabled"] == "-1")
+            {
+                SourceWriter.WriteLine(String.Format(@"{0} > SSIS records this function call is disabled", indent));
+                SourceWriter.WriteLine();
+                if (String.IsNullOrEmpty(scope_variables))
+                {
+                    SourceWriter.WriteLine(String.Format(@"{0}* EXECUTE {1}", indent, GetFunctionName()));
+                }
+                else
+                {
+                    SourceWriter.WriteLine(String.Format(@"{0}* EXECUTE {1} WITH PARAMETERS {2}", indent, GetFunctionName(), scope_variables));
+                }
+            }
+            else
+            {
+                if (String.IsNullOrEmpty(scope_variables))
+                {
+                    SourceWriter.WriteLine(String.Format(@"{0}* EXECUTE **{1}**", indent, GetFunctionName()));
+                }
+                else
+                {
+                    SourceWriter.WriteLine(String.Format(@"{0}* EXECUTE {1} WITH PARAMETERS {2}", indent, GetFunctionName(), scope_variables));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Write out an SQL statement
+        /// </summary>
+        /// <param name="indent_depth"></param>
+        /// <param name="sw"></param>
+        private void EmitSqlStatement(string indent)
+        {
+            SourceWriter.WriteLine();
+            // Retrieve the connection string object
+            string conn_guid = Attributes["SQLTask:Connection"];
+            string connstr = ConnectionWriter.GetConnectionStringName(conn_guid);
+            string connprefix = ConnectionWriter.GetConnectionStringPrefix(conn_guid);
+
+            // Show the connection
+            SourceWriter.WriteLine("{0}Using Connection String : {1}", indent, connstr);
+            SourceWriter.WriteLine();
+
+            // Retrieve the SQL String and put it in a resource
+            string raw_sql = Attributes["SQLTask:SqlStatementSource"];
+            SourceWriter.WriteLine("{0}Execute SQL Statement : {1}", indent, raw_sql);
+            SourceWriter.WriteLine();
+
+            int timeout = int.Parse(this.Attributes["SQLTask:TimeOut"]);
+            SourceWriter.WriteLine(@"{0}With TimeOut = {1}", indent, timeout);
+            SourceWriter.WriteLine();
+
+            // Do we have a result binding?
+            SsisObject binding = GetChildByType("SQLTask:ResultBinding");
+
+            // Bound result
+            if (binding != null)
+            {
+                string varname = binding.Attributes["SQLTask:DtsVariableName"];
+                string fixedname = FixVariableName(varname);
+                ProgramVariable vd = _var_dict[fixedname];
+
+                // Are we going to return anything?  
+                if (this.Attributes.ContainsKey("SQLTask:ResultType") && this.Attributes["SQLTask:ResultType"] == "ResultSetType_SingleRow")
+                {
+                    SourceWriter.WriteLine(@"{0}And Bind To Single Row Result, {1}", indent, binding.Attributes["SQLTask:DtsVariableName"]);
+                }
+                else if (binding != null)
+                {
+                    SourceWriter.WriteLine(@"{0}And Bind To DataSet, {1} {2}", indent, vd.CSharpType, binding.Attributes["SQLTask:DtsVariableName"]);
+                }                                
+            }
+        }
+
+        private string GetParentDtsName()
+        {
+            SsisObject obj = this;
+            while (obj != null && obj.DtsObjectName == null)
+            {
+                obj = obj.Parent;
+            }
+            if (obj == null)
+            {
+                return "Unnamed";
+            }
+            else
+            {
+                return obj.DtsObjectName;
+            }
+        }
+        #endregion
+
+        #region Pipeline Logic
+        private void EmitPipeline(string indent)
+        {
+            //SourceWriter.WriteLine("PIPELINE");
+
+            // Find the component container
+            //var component_container = GetChildByType("DTS:ObjectData").GetChildByType("pipeline").GetChildByType("components");
+            var component_container = GetChildByType("components");
+            if (component_container == null)
+            {
+                SourceWriter.Help(this, "Unable to find SSIS components!");
+                return;
+            }
+
+            // Keep track of original components
+            List<SsisObject> components = new List<SsisObject>();
+            components.AddRange(component_container.Children);
+
+            // Produce all the readers
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{BCEFE59B-6819-47F7-A125-63753B33ABB7}"))
+            {
+                child.EmitPipelineReader(this, indent);
+                components.Remove(child);
+            }
+
+            // These are the "flat file source" readers
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{5ACD952A-F16A-41D8-A681-713640837664}"))
+            {
+                child.EmitFlatFilePipelineReader(this, indent);
+                components.Remove(child);
+            }
+
+            // Iterate through all transformations
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{BD06A22E-BC69-4AF7-A69B-C44C2EF684BB}"))
+            {
+                child.EmitPipelineTransform(this, indent);
+                components.Remove(child);
+            }
+
+            // Iterate through all transformations - this is basically the same thing but this time it uses "expression" rather than "type conversion"
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{2932025B-AB99-40F6-B5B8-783A73F80E24}"))
+            {
+                child.EmitPipelineTransform(this, indent);
+                components.Remove(child);
+            }
+
+            // Iterate through unions
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{4D9F9B7C-84D9-4335-ADB0-2542A7E35422}"))
+            {
+                child.EmitPipelineUnion(this, indent);
+                components.Remove(child);
+            }
+
+            // Iterate through all multicasts
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{1ACA4459-ACE0-496F-814A-8611F9C27E23}"))
+            {
+                //child.EmitPipelineMulticast(this, indent);
+                SourceWriter.WriteLine(@"{0}// MULTICAST: Using all input and writing to multiple outputs", indent);
+                components.Remove(child);
+            }
+
+            // Process all the writers
+            foreach (SsisObject child in component_container.GetChildrenByTypeAndAttr("componentClassID", "{5A0B62E8-D91D-49F5-94A5-7BE58DE508F0}"))
+            {
+                if (Program.gSqlMode == SqlCompatibilityType.SQL2008)
+                {
+                    child.EmitPipelineWriter_TableParam(this, indent);
+                }
+                else
+                {
+                    child.EmitPipelineWriter(this, indent);
+                }
+                components.Remove(child);
+            }
+
+            // Report all unknown components
+            foreach (SsisObject component in components)
+            {
+                SourceWriter.WriteLine();
+                SourceWriter.WriteLine(@"{0}**{1}**", indent, component.Attributes["name"]);
+                SourceWriter.WriteLine();
+                SourceWriter.Help(this, "I don't know how to process componentClassID = " + component.Attributes["componentClassID"]);
+            }
+        }
+
+        private List<SsisObject> GetChildrenByTypeAndAttr(string attr_key, string value)
+        {
+            List<SsisObject> list = new List<SsisObject>();
+            foreach (SsisObject child in Children)
+            {
+                string attr = null;
+                if (child.Attributes.TryGetValue(attr_key, out attr) && string.Equals(attr, value))
+                {
+                    list.Add(child);
+                }
+            }
+            return list;
+        }
+
+        private void EmitPipelineUnion(SsisObject pipeline, string indent)
+        {
+            SourceWriter.WriteLine();
+            SourceWriter.WriteLine(@"{0}// {1}", indent, Attributes["name"]);
+
+            // Create a new datatable
+            SourceWriter.WriteLine(@"{0}DataTable component{1} = new DataTable();", indent, this.Attributes["id"]);
+
+            // Add the columns we're generating
+            int i = 0;
+            List<SsisObject> transforms = this.GetChildByType("outputs").GetChildByTypeAndAttr("output", "isErrorOut", "false").GetChildByType("outputColumns").Children;
+            List<string> colnames = new List<string>();
+            foreach (SsisObject outcol in transforms)
+            {
+                ColumnVariable cv = new ColumnVariable(outcol);
+                LineageObject lo = new LineageObject(cv.LineageID, "component" + this.Attributes["id"], cv.Name);
+                i++;
+                pipeline._lineage_columns.Add(lo);
+
+                // Print out this column
+                SourceWriter.WriteLine(@"{0}component{1}.Columns.Add(new DataColumn(""{2}"", typeof({3})));", indent, this.Attributes["id"], cv.Name, cv.CsharpType());
+                DataTable dt = new DataTable();
+                colnames.Add(cv.Name);
+            }
+
+            // Loop through all the inputs and process them!
+            SsisObject outputcolumns = this.GetChildByType("outputs").GetChildByType("output").GetChildByType("outputColumns");
+            foreach (SsisObject inputtable in this.GetChildByType("inputs").Children)
+            {
+
+                // Find the name of the table by looking at the first column
+                SsisObject input_columns = inputtable.GetChildByType("inputColumns");
+                SsisObject metadata = inputtable.GetChildByType("externalMetadataColumns");
+                if (input_columns != null)
+                {
+                    SsisObject first_col = input_columns.Children[0];
+                    LineageObject first_input = pipeline.GetLineageObjectById(first_col.Attributes["lineageId"]);
+                    string component = first_input.DataTableName;
+
+                    // Read through all rows in the table
+                    SourceWriter.WriteLine(@"{0}for (int row = 0; row < {1}.Rows.Count; row++) {{", indent, component);
+                    SourceWriter.WriteLine(@"{0}    DataRow dr = component{1}.NewRow();", indent, this.Attributes["id"]);
+
+                    // Loop through all the columns and insert them
+                    foreach (SsisObject col in inputtable.GetChildByType("inputColumns").Children)
+                    {
+                        LineageObject l = pipeline.GetLineageObjectById(col.Attributes["lineageId"]);
+
+                        // find the matching external metadata column 
+                        string outcolname = "";
+                        SsisObject mdcol = metadata.GetChildByTypeAndAttr("externalMetadataColumn", "id", col.Attributes["externalMetadataColumnId"]);
+                        if (mdcol == null)
+                        {
+                            SsisObject prop = col.GetChildByType("properties").GetChildByType("property");
+                            SsisObject outcol = outputcolumns.GetChildByTypeAndAttr("outputColumn", "id", prop.ContentValue);
+                            outcolname = outcol.Attributes["name"];
+                        }
+                        else
+                        {
+                            outcolname = mdcol.Attributes["name"];
+                        }
+
+                        // Write out the expression
+                        SourceWriter.WriteLine(@"{0}    dr[""{1}""] = {2};", indent, outcolname, l.ToString());
+                    }
+
+                    // Write the end of this code block
+                    SourceWriter.WriteLine(@"{0}    component{1}.Rows.Add(dr);", indent, this.Attributes["id"]);
+                    SourceWriter.WriteLine(@"{0}}}", indent);
+                }
+            }
+        }
+
+        private void EmitPipelineWriter_TableParam(SsisObject pipeline, string indent)
+        {
+            SourceWriter.WriteLine();
+            SourceWriter.WriteLine(@"{0}// {1}", indent, Attributes["name"]);
+
+            //// Get the connection string GUID: it's this.connections.connection
+            //string conn_guid = this.GetChildByType("connections").GetChildByType("connection").Attributes["connectionManagerID"];
+            //string connstr = ConnectionWriter.GetConnectionStringName(conn_guid);
+            //string connprefix = ConnectionWriter.GetConnectionStringPrefix(conn_guid);
+
+            
+            //// It's our problem to produce the SQL statement, because this writer uses calculated data!
+            //StringBuilder sql = new StringBuilder();
+            //StringBuilder colnames = new StringBuilder();
+            //StringBuilder varnames = new StringBuilder();
+            //StringBuilder paramsetup = new StringBuilder();
+            //StringBuilder TableParamCreate = new StringBuilder();
+            //StringBuilder TableSetup = new StringBuilder();
+
+            //// Create the table parameter insert statement
+            //string tableparamname = this.GetFunctionName() + "_WritePipe_TableParam";
+            //TableParamCreate.AppendFormat("IF EXISTS (SELECT * FROM systypes where name = '{0}') DROP TYPE {0}; {1} CREATE TYPE {0} AS TABLE (", tableparamname, Environment.NewLine);
+
+            //// Retrieve the names of the columns we're inserting
+            //SsisObject metadata = this.GetChildByType("inputs").GetChildByType("input").GetChildByType("externalMetadataColumns");
+            //SsisObject columns = this.GetChildByType("inputs").GetChildByType("input").GetChildByType("inputColumns");
+
+            //// Okay, let's produce the columns we're inserting
+            //foreach (SsisObject column in columns.Children)
+            //{
+            //    ColumnVariable cv = new ColumnVariable(metadata.GetChildByTypeAndAttr("externalMetadataColumn", "id", column.Attributes["externalMetadataColumnId"]));
+
+            //    // Add to the table parameter create
+            //    TableParamCreate.AppendFormat("{0} {1} NULL, ", cv.Name, cv.SqlDbType());
+
+            //    // List of columns in the insert
+            //    colnames.AppendFormat("{0}, ", cv.Name);
+
+            //    // List of parameter names in the values clause
+            //    varnames.AppendFormat("@{0}, ", cv.Name);
+
+            //    // The columns in the in-memory table
+            //    TableSetup.AppendFormat(@"{0}component{1}.Columns.Add(""{2}"");{3}", indent, this.Attributes["id"], cv.Name, Environment.NewLine);
+
+            //    // Find the source column in our lineage data
+            //    string lineageId = column.Attributes["lineageId"];
+            //    LineageObject lo = pipeline.GetLineageObjectById(lineageId);
+
+            //    // Parameter setup instructions
+            //    if (lo == null)
+            //    {
+            //        SourceWriter.Help(this, "I couldn't find lineage column " + lineageId);
+            //        paramsetup.AppendFormat(@"{0}            // Unable to find column {1}{2}", indent, lineageId, Environment.NewLine);
+            //    }
+            //    else
+            //    {
+            //        paramsetup.AppendFormat(@"{0}    dr[""{1}""] = {2};{3}", indent, cv.Name, lo.ToString(), Environment.NewLine);
+            //    }
+            //}
+            //colnames.Length -= 2;
+            //varnames.Length -= 2;
+            //TableParamCreate.Length -= 2;
+            //TableParamCreate.Append(")");
+
+            //// Insert the table parameter create statement in the project
+            //string sql_tableparam_resource = ProjectWriter.AddSqlResource(GetParentDtsName() + "_WritePipe_TableParam", TableParamCreate.ToString());
+
+            //// Produce a data set that we're going to process - name it after ourselves
+            //SourceWriter.WriteLine(@"{0}DataTable component{1} = new DataTable();", indent, this.Attributes["id"]);
+            //SourceWriter.WriteLine(TableSetup.ToString());
+
+            //// Check the inputs to see what component we're using as the source
+            //string component = null;
+            //foreach (SsisObject incol in this.GetChildByType("inputs").GetChildByType("input").GetChildByType("inputColumns").Children)
+            //{
+            //    LineageObject input = pipeline.GetLineageObjectById(incol.Attributes["lineageId"]);
+            //    if (component == null)
+            //    {
+            //        component = input.DataTableName;
+            //    }
+            //    else
+            //    {
+            //        if (component != input.DataTableName)
+            //        {
+            //            //SourceWriter.Help(this, "This SSIS pipeline is merging different component tables!");
+            //            // From closer review, this doesn't look like a problem - it's most likely due to transformations occuring on output of a table
+            //        }
+            //    }
+            //}
+
+            // Now fill the table in memory
+            //SourceWriter.WriteLine();
+            //SourceWriter.WriteLine(@"{0}// Fill our table parameter in memory", indent);
+            //SourceWriter.WriteLine(@"{0}for (int row = 0; row < {1}.Rows.Count; row++) {{", indent, component);
+            //SourceWriter.WriteLine(@"{0}    DataRow dr = component{1}.NewRow();", indent, this.Attributes["id"]);
+            //SourceWriter.WriteLine(paramsetup.ToString());
+            //SourceWriter.WriteLine(@"{0}    component{1}.Rows.Add(dr);", indent, this.Attributes["id"]);
+            //SourceWriter.WriteLine(@"{0}}}", indent);
+
+            //// Produce the SQL statement
+            //sql.AppendFormat("INSERT INTO {0} ({1}) SELECT {1} FROM @tableparam",
+            //    GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "OpenRowset").ContentValue,
+            //    colnames.ToString());
+            //string sql_resource_name = ProjectWriter.AddSqlResource(GetParentDtsName() + "_WritePipe", sql.ToString());
+
+            //// Write the using clause for the connection
+            //SourceWriter.WriteLine();
+            ////SourceWriter.WriteLine(@"{0}// Time to drop this all into the database", indent);
+            //SourceWriter.WriteLine(@"{0}using (var conn = new {2}Connection(ConfigurationManager.AppSettings[""{1}""]{3})) {{", indent, connstr, connprefix, fixup);
+            //SourceWriter.WriteLine(@"{0}    conn.Open();", indent);
+
+            //// Ensure the table parameter type has been created correctly
+            //SourceWriter.WriteLine();
+            //SourceWriter.WriteLine(@"{0}    // Ensure the table parameter type has been created successfully", indent);
+            //SourceWriter.WriteLine(@"{0}    CreateTableParamType(""{1}"", conn);", indent, sql_tableparam_resource);
+
+            //// Let's use our awesome table parameter style!
+            //SourceWriter.WriteLine();
+            //SourceWriter.WriteLine(@"{0}    // Insert all rows at once using fast table parameter insert", indent);
+            //SourceWriter.WriteLine(@"{0}    using (var cmd = new {2}Command(Resource1.{1}, conn)) {{", indent, sql_resource_name, connprefix);
+
+            //// Determine the timeout value specified in the pipeline
+            //SsisObject timeout_property = this.GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "CommandTimeout");
+            //if (timeout_property != null)
+            //{
+            //    int timeout = int.Parse(timeout_property.ContentValue);
+            //    SourceWriter.WriteLine(@"{0}        cmd.CommandTimeout = {1};", indent, timeout);
+            //}
+
+            // Insert the table in one swoop
+            
+        }
+
+        private void EmitPipelineWriter(SsisObject pipeline, string indent)
+        {
+            SourceWriter.WriteLine();
+            SourceWriter.WriteLine(@"{0}**{1}**", indent, Attributes["name"]);
+
+            // Get the connection string GUID: it's this.connections.connection
+            string conn_guid = this.GetChildByType("connections").GetChildByType("connection").Attributes["connectionManagerID"];
+            string connstr = ConnectionWriter.GetConnectionStringName(conn_guid);
+            string connprefix = ConnectionWriter.GetConnectionStringPrefix(conn_guid);
+                       
+
+            // It's our problem to produce the SQL statement, because this writer uses calculated data!
+            StringBuilder sql = new StringBuilder();
+            StringBuilder colnames = new StringBuilder();
+            StringBuilder varnames = new StringBuilder();
+            StringBuilder paramsetup = new StringBuilder();
+
+            // Retrieve the names of the columns we're inserting
+            SsisObject metadata = this.GetChildByType("inputs").GetChildByType("input").GetChildByType("externalMetadataColumns");
+            SsisObject columns = this.GetChildByType("inputs").GetChildByType("input").GetChildByType("inputColumns");
+
+            // Okay, let's produce the columns we're inserting
+            foreach (SsisObject column in columns.Children)
+            {
+                SsisObject mdcol = metadata.GetChildByTypeAndAttr("externalMetadataColumn", "id", column.Attributes["externalMetadataColumnId"]);
+
+                // List of columns in the insert
+                colnames.Append(mdcol.Attributes["name"]);
+                colnames.Append(", ");
+
+                // List of parameter names in the values clause
+                varnames.Append("@");
+                varnames.Append(mdcol.Attributes["name"]);
+                varnames.Append(", ");
+
+                // Find the source column in our lineage data
+                string lineageId = column.Attributes["lineageId"];
+                LineageObject lo = pipeline.GetLineageObjectById(lineageId);
+
+                // Parameter setup instructions
+                if (lo == null)
+                {
+                    SourceWriter.Help(this, "I couldn't find lineage column " + lineageId);
+                    paramsetup.AppendFormat(@"{0}            // Unable to find column {1}{2}", indent, lineageId, Environment.NewLine);
+                }
+                else
+                {
+
+                    // Is this a string?  If so, forcibly truncate it
+                    if (mdcol.Attributes["dataType"] == "str")
+                    {
+                        paramsetup.AppendFormat(@"{0}            cmd.Parameters.Add(new SqlParameter(""@{1}"", SqlDbType.VarChar, {3}, ParameterDirection.Input, false, 0, 0, null, DataRowVersion.Current, {2}));
+", indent, mdcol.Attributes["name"], lo.ToString(), mdcol.Attributes["length"]);
+                    }
+                    else if (mdcol.Attributes["dataType"] == "wstr")
+                    {
+                        paramsetup.AppendFormat(@"{0}            cmd.Parameters.Add(new SqlParameter(""@{1}"", SqlDbType.NVarChar, {3}, ParameterDirection.Input, false, 0, 0, null, DataRowVersion.Current, {2}));
+", indent, mdcol.Attributes["name"], lo.ToString(), mdcol.Attributes["length"]);
+                    }
+                    else
+                    {
+                        paramsetup.AppendFormat(@"{0}            cmd.Parameters.AddWithValue(""@{1}"",{2});
+", indent, mdcol.Attributes["name"], lo.ToString());
+                    }
+                }
+            }
+            colnames.Length -= 2;
+            varnames.Length -= 2;
+
+            // Produce the SQL statement
+            sql.Append("INSERT INTO ");
+            sql.Append(GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "OpenRowset").ContentValue);
+            sql.Append(" (");
+            sql.Append(colnames.ToString());
+            sql.Append(") VALUES (");
+            sql.Append(varnames.ToString());
+            sql.Append(")");
+            string sql_resource_name = ProjectWriter.AddSqlResource(GetParentDtsName() + "_WritePipe", sql.ToString());
+                       
+            // Check the inputs to see what component we're using as the source
+            string component = null;
+            foreach (SsisObject incol in this.GetChildByType("inputs").GetChildByType("input").GetChildByType("inputColumns").Children)
+            {
+                LineageObject input = pipeline.GetLineageObjectById(incol.Attributes["lineageId"]);
+                if (component == null)
+                {
+                    component = input.DataTableName;
+                }
+                else
+                {
+                    if (component != input.DataTableName)
+                    {
+                        //SourceWriter.Help(this, "This SSIS pipeline is merging different component tables!");
+                        //From closer review, this doesn't look like a problem - it's most likely due to transformations occuring on output of a table
+                    }
+                }
+            }            
+        }
+
+        private void EmitPipelineTransform(SsisObject pipeline, string indent)
+        {
+            // Add the columns we're generating
+            List<SsisObject> transforms = this.GetChildByType("outputs").GetChildByTypeAndAttr("output", "isErrorOut", "false").GetChildByType("outputColumns").Children;
+
+            //// Check the inputs to see what component we're using as the source
+            //string component = "component1";
+            //SsisObject inputcolumns = this.GetChildByType("inputs").GetChildByType("input").GetChildByType("inputColumns");
+            //if (inputcolumns != null)
+            //{
+            //    foreach (SsisObject incol in inputcolumns.Children)
+            //    {
+            //        LineageObject input = pipeline.GetLineageObjectById(incol.Attributes["lineageId"]);
+            //        if (component == null)
+            //        {
+            //            component = input.DataTableName;
+            //        }
+            //        else
+            //        {
+            //            if (component != input.DataTableName)
+            //            {
+            //                SourceWriter.Help(this, "This SSIS pipeline is merging different component tables!");
+            //            }
+            //        }
+            //    }
+            //}
+
+            //// Let's see if we can generate some code to do these conversions!
+            //foreach (SsisObject outcol in transforms)
+            //{
+            //    ColumnVariable cv = new ColumnVariable(outcol);
+            //    LineageObject source_lineage = null;
+            //    string expression = null;
+
+            //    // Find property "expression"
+            //    if (outcol.Children.Count > 0)
+            //    {
+            //        foreach (SsisObject property in outcol.GetChildByType("properties").Children)
+            //        {
+            //            if (property.Attributes["name"] == "SourceInputColumnLineageID")
+            //            {
+            //                source_lineage = pipeline.GetLineageObjectById(property.ContentValue);
+            //                expression = String.Format(@"Convert.ChangeType({1}.Rows[row][""{2}""], typeof({0}));", cv.CsharpType(), source_lineage.DataTableName, source_lineage.FieldName);
+            //            }
+            //            else if (property.Attributes["name"] == "FastParse")
+            //            {
+            //                // Don't need to do anything here
+            //            }
+            //            else if (property.Attributes["name"] == "Expression")
+            //            {
+
+            //                // Is this a lineage column?
+            //                expression = FixExpression(cv.CsharpType(), pipeline._lineage_columns, property.ContentValue, true);
+            //            }
+            //            else if (property.Attributes["name"] == "FriendlyExpression")
+            //            {
+            //                // This comment is useless - SourceWriter.WriteLine(@"{0}    // {1}", indent, property.ContentValue);
+            //            }
+            //            else
+            //            {
+            //                SourceWriter.Help(this, "I don't understand the output column property '" + property.Attributes["name"] + "'");
+            //            }
+            //        }
+
+            //        // If we haven't been given an explicit expression, just use this
+            //        if (String.IsNullOrEmpty(expression))
+            //        {
+            //            SourceWriter.Help(this, "I'm trying to do a transform, but I haven't found an expression to use.");
+            //        }
+            //        else
+            //        {
+
+            //            // Put this transformation back into the lineage table for later use!
+            //            LineageObject lo = new LineageObject(outcol.Attributes["lineageId"], expression);
+            //            pipeline._lineage_columns.Add(lo);
+            //        }
+            //    }
+            //    else
+            //    {
+            //        SourceWriter.Help(this, "I'm trying to do a transform, but I don't have any properties to use.");
+            //    }
+            //}
+        }
+
+        private void EmitFlatFilePipelineReader(SsisObject pipeline, string indent)
+        {
+            SourceWriter.WriteLine("{0}Flatfile Pipeline Reader", indent);
+            
+            // Produce a function header
+            SourceWriter.WriteLine();
+            SourceWriter.WriteLine(@"{0}{1}", indent, Attributes["name"]);
+
+            // Get the connection string GUID: it's this.connections.connection
+            string conn_guid = this.GetChildByType("connections").GetChildByType("connection").Attributes["connectionManagerID"];
+            SsisObject flat_file_obj = GetObjectByGuid(conn_guid).Children[0].Children[0];
+
+            // Some sensible checks
+            if (flat_file_obj.Properties["Format"] != "Delimited")
+            {
+                SourceWriter.Help(flat_file_obj, "The flat file data source is not delimited - no support for this file type!");
+            }
+
+            // Retrieve what we need to know about this flat file
+            string filename = flat_file_obj.Properties["ConnectionString"];
+
+            // Generate the list of column headers from the connection string object
+            List<SsisObject> columns = new List<SsisObject>();
+            foreach (var child in flat_file_obj.Children)
+            {
+                if (child.DtsObjectType == "DTS:FlatFileColumn")
+                {
+                    columns.Add(child);
+                }
+            }
+
+            // Now produce the list of lineage objects from the component
+            List<SsisObject> outputs = new List<SsisObject>();
+            foreach (var child in this.GetChildByType("outputs").GetChildByType("output").GetChildByType("outputColumns").Children)
+            {
+                if (child.DtsObjectType == "outputColumn")
+                {
+                    outputs.Add(child);
+                }
+            }
+
+            if (columns.Count != outputs.Count)
+            {
+                SourceWriter.Help(this, "The list of columns in this flat file component doesn't match the columns in the data source.");
+            }
+
+            //// Now pair up all the outputs to generate header columns and lineage objects
+            //StringBuilder headers = new StringBuilder("new string[] {");
+            //for (int i = 0; i < columns.Count; i++)
+            //{
+            //    string name = columns[i].DtsObjectName;
+            //    headers.AppendFormat("\"{0}\", ", name.Replace("\"", "\\\""));
+            //    LineageObject lo = new LineageObject(outputs[i].Attributes["lineageId"], "component" + this.Attributes["id"], name);
+            //    pipeline._lineage_columns.Add(lo);
+            //}
+            //headers.Length -= 2;
+            //headers.Append(" }");
+
+            //// This is set to -1 if the column names aren't in the first row in the data file
+            //string qual = FixDelimiter(flat_file_obj.Properties["TextQualifier"]);
+            //string delim = FixDelimiter(columns[0].Properties["ColumnDelimiter"]);
+            //if (flat_file_obj.Properties["ColumnNamesInFirstDataRow"] == "-1")
+            //{
+            //    SourceWriter.WriteLine(@"{0}DataTable component{1} = CSVFile.CSV.LoadDataTable(""{2}"", {3}, true, '{4}', '{5}');", indent, this.Attributes["id"], filename.Replace("\\", "\\\\"), headers.ToString(), delim, qual);
+            //}
+            //else
+            //{
+            //    SourceWriter.WriteLine(@"{0}DataTable component{1} = CSVFile.CSV.LoadDataTable(""{2}"", true, true, '{3}', '{4}');", indent, this.Attributes["id"], filename.Replace("\\", "\\\\"), delim, qual);
+            //}
+        }
+
+        /// <summary>
+        /// Take a hex-encoded delimiter and turn it into a real string
+        /// </summary>
+        /// <param name="p"></param>
+        /// <returns></returns>
+        private string FixDelimiter(string s)
+        {
+            // Here's a regex
+            Regex r = new Regex("_x[0-9A-F][0-9A-F][0-9A-F][0-9A-F]_");
+
+            // Chip apart into individual hex bits
+            while (true)
+            {
+
+                // Look for a match
+                Match m = r.Match(s);
+                if (m.Success)
+                {
+                    int val = Convert.ToInt32(m.Value.Substring(2, 4), 16);
+                    char c = (char)val;
+                    s = s.Substring(0, m.Index) + c + s.Substring(m.Index + m.Length);
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            // Here's what you've got
+            return s;
+        }
+
+        private void EmitPipelineReader(SsisObject pipeline, string indent)
+        {
+            SourceWriter.WriteLine();
+            SourceWriter.WriteLine(@"{0}**{1}**", indent, Attributes["name"]);
+            SourceWriter.WriteLine();
+
+            // Get the connection string GUID: it's this.connections.connection
+            string conn_guid = this.GetChildByType("connections").GetChildByType("connection").Attributes["connectionManagerID"];
+            string connstr = ConnectionWriter.GetConnectionStringName(conn_guid);
+            string connprefix = ConnectionWriter.GetConnectionStringPrefix(conn_guid);
+
+            SourceWriter.WriteLine(@"{0}Using ConnectionString**{1}**", indent, connstr);
+            SourceWriter.WriteLine();
+
+            // Get the SQL statement
+            string sql = this.GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "SqlCommand").ContentValue;
+            if (sql == null)
+            {
+                string rowset = this.GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "OpenRowset").ContentValue;
+                if (rowset == null)
+                {
+                    sql = this.GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "SqlCommandVariable").ContentValue;
+                    if (sql == null)
+                    {
+                        sql = "COULD NOT FIND SQL STATEMENT";
+                        SourceWriter.Help(pipeline, String.Format("Could not find SQL for {0} in {1}", Attributes["name"], this.DtsId));
+                    }
+                }
+                else
+                {
+                    sql = "SELECT * FROM " + rowset;
+                }
+            }
+
+            SourceWriter.WriteLine(@"{0}Execute SQL **{1}**", indent, sql);
+            SourceWriter.WriteLine();
+            
+            //// Keep track of the lineage of all of our output columns 
+            //// TODO: Handle error output columns
+            //int i = 0;
+            //foreach (SsisObject outcol in this.GetChildByType("outputs").GetChildByTypeAndAttr("output", "isErrorOut", "false").GetChildByType("outputColumns").Children)
+            //{
+            //    LineageObject lo = new LineageObject(outcol.Attributes["lineageId"], "component" + this.Attributes["id"], outcol.Attributes["name"]);
+            //    i++;
+            //    pipeline._lineage_columns.Add(lo);
+            //}
+
+            //// Determine the timeout value specified in the pipeline
+            //SsisObject timeout_property = this.GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "CommandTimeout");
+            //if (timeout_property != null)
+            //{
+            //    int timeout = int.Parse(timeout_property.ContentValue);
+            //    SourceWriter.WriteLine(@"{0}        cmd.CommandTimeout = {1};", indent, timeout);
+            //}
+
+            //// Okay, let's load the parameters
+            //var paramlist = this.GetChildByType("properties").GetChildByTypeAndAttr("property", "name", "ParameterMapping");
+            //if (paramlist != null && paramlist.ContentValue != null)
+            //{
+            //    string[] p = paramlist.ContentValue.Split(';');
+            //    int paramnum = 0;
+            //    foreach (string oneparam in p)
+            //    {
+            //        if (!String.IsNullOrEmpty(oneparam))
+            //        {
+            //            string[] parts = oneparam.Split(',');
+            //            Guid g = Guid.Parse(parts[1]);
+
+            //            // Look up this GUID - can we find it?
+            //            SsisObject v = GetObjectByGuid(g);
+            //            if (connprefix == "OleDb")
+            //            {
+            //                SourceWriter.WriteLine(@"{0}        cmd.Parameters.Add(new OleDbParameter(""@p{2}"",{1}));", indent, v.DtsObjectName, paramnum);
+            //            }
+            //            else
+            //            {
+            //                SourceWriter.WriteLine(@"{0}        cmd.Parameters.AddWithValue(""@{1}"",{2});", indent, parts[0], v.DtsObjectName);
+            //            }
+            //        }
+            //        paramnum++;
+            //    }
+            //}
+        }
+        #endregion
+
+        #region Helper functions
+
+        public static string FixExpression(string expected_type, List<LineageObject> list, string expression, bool inline)
+        {
+            ExpressionData ed = new ExpressionData(expected_type, list, expression);
+            return ed.ToCSharp(inline);
+        }
+
+        /// <summary>
+        /// Converts the namespace into something usable by C#
+        /// </summary>
+        /// <param name="original_variable_name"></param>
+        /// <returns></returns>
+        public static string FixVariableName(string original_variable_name)
+        {
+            // We are simply stripping out namespaces for the moment
+            int p = original_variable_name.IndexOf("::");
+            if (p > 0)
+            {
+                return original_variable_name.Substring(p + 2);
+            }
+            return original_variable_name;
+        }
+
+        public string GetScopeVariables(bool include_type)
+        {
+            // Do we have any variables to pass?
+            StringBuilder p = new StringBuilder();
+            if (include_type)
+            {
+                foreach (ProgramVariable vd in _scope_variables)
+                {
+                    p.AppendFormat("ref {0} {1}, ", vd.CSharpType, vd.VariableName);
+                }
+            }
+            else
+            {
+                foreach (ProgramVariable vd in _scope_variables)
+                {
+                    p.AppendFormat("ref {0}, ", vd.VariableName);
+                }
+            }
+            if (p.Length > 0) p.Length -= 2;
+            return p.ToString();
+        }
+
+        private static List<string> _func_names = new List<string>();
+        public string GetFunctionName()
+        {
+            if (_FunctionName == null)
+            {
+                Regex rgx = new Regex("[^a-zA-Z0-9]");
+                //string fn = rgx.Replace(GetParentDtsName(), "_");
+                string fn = GetParentDtsName();
+
+                // Uniqueify!
+                int i = 0;
+                string newfn = fn;
+                //while (_func_names.Contains(newfn))
+                //{
+                //    i++;
+                //    newfn = fn + "_" + i.ToString();
+                //}
+                _FunctionName = newfn;
+                //_func_names.Add(_FunctionName);
+            }
+            return _FunctionName;
+        }
+
+        private static Dictionary<Guid, SsisObject> _guid_lookup = new Dictionary<Guid, SsisObject>();
+        public static SsisObject GetObjectByGuid(string s)
+        {
+            return GetObjectByGuid(Guid.Parse(s));
+        }
+
+        public static SsisObject GetObjectByGuid(Guid g)
+        {
+            SsisObject v = null;
+            if (!_guid_lookup.TryGetValue(g, out v))
+            {
+                SourceWriter.Help(null, "Can't find object matching GUID " + g.ToString());
+            }
+            return v;
+        }
+
+        private static List<string> _folder_names = new List<string>();
+        public string GetFolderName()
+        {
+            if (_FolderName == null)
+            {
+                Regex rgx = new Regex("[^a-zA-Z0-9]");
+                //string fn = rgx.Replace(GetParentDtsName(), "");
+                string fn = GetParentDtsName();
+
+                // Uniqueify!
+                int i = 0;
+                string newfn = fn;
+                //while (_folder_names.Contains(newfn))
+                //{
+                //    i++;
+                //    newfn = fn + "_" + i.ToString();
+                //}
+                _FolderName = newfn;
+                //_folder_names.Add(_FolderName);
+            }
+            return _FolderName;
+        }
+
+        public Guid GetNearestGuid()
+        {
+            SsisObject o = this;
+            while (o != null && (o.DtsId == null || o.DtsId == Guid.Empty))
+            {
+                o = o.Parent;
+            }
+            if (o != null) return o.DtsId;
+            return Guid.Empty;
+        }
+        #endregion
+    }
+}
